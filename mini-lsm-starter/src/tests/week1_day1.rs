@@ -78,7 +78,7 @@ fn test_task2_storage_integration() {
     assert_eq!(&storage.get(b"2").unwrap().unwrap()[..], b"2333");
     assert_eq!(&storage.get(b"3").unwrap().unwrap()[..], b"23333");
     storage.delete(b"2").unwrap();
-    assert!(storage.get(b"2").unwrap().is_none());
+    assert!(storage.get(b"2").unwrap().is_none()); // !error.  get()中忘处理最外层val墓碑情况.
     storage.delete(b"0").unwrap(); // should NOT report any error
 }
 
@@ -94,7 +94,7 @@ fn test_task3_storage_integration() {
     storage
         .force_freeze_memtable(&storage.state_lock.lock())
         .unwrap();
-    assert_eq!(storage.state.read().imm_memtables.len(), 1);
+    assert_eq!(storage.state.read().imm_memtables.len(), 1); // err
     let previous_approximate_size = storage.state.read().imm_memtables[0].approximate_size();
     assert!(previous_approximate_size >= 15);
     storage.put(b"1", b"2333").unwrap();
