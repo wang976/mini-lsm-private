@@ -15,6 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use core::sync;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
@@ -34,14 +35,18 @@ use crate::wal::Wal;
 ///
 /// An initial implementation of memtable is part of week 1, day 1. It will be incrementally implemented in other
 /// chapters of week 1 and week 2.
+// wal: 日志, 保证崩溃恢复.
+// memtable: 内存有序结构  -> 一般用跳表实现
 pub struct MemTable {
-    map: Arc<SkipMap<Bytes, Bytes>>,
+    // Bytes 来自 bytes crate，可以理解为便宜 clone 的不可变字节缓冲区
+    map: Arc<SkipMap<Bytes, Bytes>>, // Arc<T> 类似于 C++ 中的 std::shared_ptr<T>
     wal: Option<Wal>,
-    id: usize,
-    approximate_size: Arc<AtomicUsize>,
+    id: usize,                          // 类似于 C++ 中 size_t.  memtable的编号.
+    approximate_size: Arc<AtomicUsize>, // 记录 memtable 大概占用的内存大小，用来判断什么时候需要 freeze/flush
 }
 
 /// Create a bound of `Bytes` from a bound of `&[u8]`.
+// fn 定义函数。pub(crate) 表示“当前 crate 内可见”. &[u8] 是字节 slice，类似 C++ 的 std::span<const uint8_t> 或 string_view。它不拥有数据，只借用一段连续内存。
 pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
     match bound {
         Bound::Included(x) => Bound::Included(Bytes::copy_from_slice(x)),
@@ -53,10 +58,19 @@ pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
 impl MemTable {
     /// Create a new mem-table.
     pub fn create(_id: usize) -> Self {
-        unimplemented!()
+        // unimplemented!()
+        // 参考 LsmStorageState::create()
+
+        Self {
+            map: Arc::new(SkipMap::new()),
+            wal: None, // TODO(after): week1 day1
+            id: _id,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Create a new mem-table with WAL
+    // impl AsRef<Path> 表示这个参数可以是任何实现了 AsRef<Path> trait 的类型。可以传 Path、PathBuf、字符串等可转为路径引用的东西。
     pub fn create_with_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
         unimplemented!()
     }
@@ -85,9 +99,13 @@ impl MemTable {
         self.scan(lower, upper)
     }
 
-    /// Get a value by key.
+    /// Get a value by key.  Option<Bytes>含义: None 没找到这个 key, Some(bytes) 找到了value.
     pub fn get(&self, _key: &[u8]) -> Option<Bytes> {
-        unimplemented!()
+        // unimplemented!()
+        // 你需要实现 MemTable::get 和 MemTable::put 以支持对内存表的修改
+
+        // .map(...): 如果是 Some(e), 就把里面的 e 转换成 e.value().clone(); 如果是 None, 就继续保持 None.
+        self.map.get(_key).map(|e| e.value().clone())
     }
 
     /// Put a key-value pair into the mem-table.
@@ -96,7 +114,17 @@ impl MemTable {
     /// In week 2, day 6, also flush the data to WAL.
     /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+        // unimplemented!()
+        self.map
+            .insert(Bytes::copy_from_slice(_key), Bytes::copy_from_slice(_value));
+
+        // 添加 memtable 占用内存大小
+        // 即使某个键被插入两次（尽管跳表仅保留最新值），在计算大致 memtable 大小时仍需将其计算两次。
+        let size = self
+            .approximate_size
+            .fetch_add(_key.len() + _value.len(), sync::atomic::Ordering::Relaxed);
+
+        Ok(()) // 插入成功返回.  以符合 Result<()>签名
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
@@ -104,11 +132,12 @@ impl MemTable {
         unimplemented!()
     }
 
+    // Result<()> 这里来自 anyhow::Result，大致等价于 Result<(), anyhow::Error>。() 是 unit 类型，类似 C++ 的 void 值。
     pub fn sync_wal(&self) -> Result<()> {
         if let Some(ref wal) = self.wal {
-            wal.sync()?;
+            wal.sync()?; // \ ? 是错误传播操作符。wal.sync()?; 的含义是：如果成功，继续执行；如果失败，立刻从当前函数返回错误
         }
-        Ok(())
+        Ok(()) // 表示返回成功且没有额外值。
     }
 
     /// Get an iterator over a range of keys.
@@ -121,6 +150,7 @@ impl MemTable {
         unimplemented!()
     }
 
+    // &self 是不可变借用当前对象，类似 C++ 的 const MemTable& self，但 Rust 显式写出来
     pub fn id(&self) -> usize {
         self.id
     }

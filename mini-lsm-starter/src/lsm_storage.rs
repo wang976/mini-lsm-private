@@ -17,11 +17,12 @@
 
 use std::collections::HashMap;
 use std::ops::Bound;
+// use std::os::linux::raw::stat;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -42,16 +43,16 @@ pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 #[derive(Clone)]
 pub struct LsmStorageState {
     /// The current memtable.
-    pub memtable: Arc<MemTable>,
+    pub memtable: Arc<MemTable>, // 存储当前正在写的可变内存表.  week1: 目前只会使用 memtable 字段.
     /// Immutable memtables, from latest to earliest.
-    pub imm_memtables: Vec<Arc<MemTable>>,
+    pub imm_memtables: Vec<Arc<MemTable>>, // 已冻结、等待 flush 的内存表
     /// L0 SSTs, from latest to earliest.
-    pub l0_sstables: Vec<usize>,
+    pub l0_sstables: Vec<usize>, // L0 层 SSTable id, 新的在前
     /// SsTables sorted by key range; L1 - L_max for leveled compaction, or tiers for tiered
     /// compaction.
-    pub levels: Vec<(usize, Vec<usize>)>,
+    pub levels: Vec<(usize, Vec<usize>)>, // L1+ 或 tiers 的 SSTable id
     /// SST objects.
-    pub sstables: HashMap<usize, Arc<SsTable>>,
+    pub sstables: HashMap<usize, Arc<SsTable>>, // id -> SSTable 对象
 }
 
 pub enum WriteBatchRecord<T: AsRef<[u8]>> {
@@ -60,6 +61,7 @@ pub enum WriteBatchRecord<T: AsRef<[u8]>> {
 }
 
 impl LsmStorageState {
+    // 创建 LSM 结构时, 会初始化一个 ID 为0的内存表.
     fn create(options: &LsmStorageOptions) -> Self {
         let levels = match &options.compaction_options {
             CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. })
@@ -83,21 +85,21 @@ impl LsmStorageState {
 #[derive(Debug, Clone)]
 pub struct LsmStorageOptions {
     // Block size in bytes
-    pub block_size: usize,
+    pub block_size: usize, //* SSTable 内部每个 block 的目标大小
     // SST size in bytes, also the approximate memtable capacity limit
-    pub target_sst_size: usize,
+    pub target_sst_size: usize, //* SSTable 目标大小, 也作为 memtable 的近似容量上限.
     // Maximum number of memtables in memory, flush to L0 when exceeding this limit
-    pub num_memtable_limit: usize,
+    pub num_memtable_limit: usize, //* 内存中 memtable 数量上限, 超过后推动 flush
     pub compaction_options: CompactionOptions,
-    pub enable_wal: bool,
-    pub serializable: bool,
+    pub enable_wal: bool,   // 是否启用预写日志, 用于崩溃恢复
+    pub serializable: bool, // 是否开启 serializable 事务隔离
 }
 
 impl LsmStorageOptions {
     pub fn default_for_week1_test() -> Self {
         Self {
-            block_size: 4096,
-            target_sst_size: 2 << 20,
+            block_size: 4096,         // 4 kiB
+            target_sst_size: 2 << 20, // 2 MB
             compaction_options: CompactionOptions::NoCompaction,
             enable_wal: false,
             num_memtable_limit: 50,
@@ -135,8 +137,9 @@ pub enum CompactionFilter {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
-    pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
-    pub(crate) state_lock: Mutex<()>,
+    // 访问 memtable 只需要拿 state 读锁. 当要改变 "LSM结构" 本身, 才需要 state.write.
+    pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>, // tip: 要访问 memtable, 你需要获取 state 锁. 你只需获取读锁即可修改内存表.
+    pub(crate) state_lock: Mutex<()>, // "互斥"令牌, 拿到这个锁, 就有资格执行一次 LSM 状态变更流程.   不影响读进程.
     path: PathBuf,
     pub(crate) block_cache: Arc<BlockCache>,
     next_sst_id: AtomicUsize,
@@ -298,7 +301,49 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+        // unimplemented!()
+        // let state =  {
+        //     let state_guard = self.state.read();
+        //     Arc::clone(&*&state_guard)
+        // };
+
+        let val = {
+            let state_guard = self.state.read();
+            state_guard.memtable.get(_key)
+        };
+
+        // 若没找到key, 则依次查询下一层  memtable -> imm_memtable -> L0 SSTables -> L1/L2/...SSTables.
+        if val.is_none() {
+            let state_guard = self.state.read();
+
+            for imm_table in &state_guard.imm_memtables {
+                let imm_val = imm_table.get(_key);
+
+                match imm_val {
+                    None => {
+                        continue;
+                    }
+                    // 处理空切片, 即墓碑
+                    Some(value) if value.is_empty() => {
+                        return Ok(None);
+                    }
+                    Some(value) => {
+                        return Ok(Some(value));
+                    }
+                }
+            }
+        }
+
+        // 这里也要处理墓碑
+        if let Some(ref v) = val
+            && v.is_empty()
+        {
+            return Ok(None);
+        }
+
+        // TODO(wangb): 当前未实现 L0以及 L1+ 的 SSTable 逻辑
+
+        Ok(val)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -308,12 +353,51 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+        // unimplemented!()
+        // 你只需对 state 获取读锁即可修改内存表。这使得多个线程可以并发访问内存表。
+
+        let is_freeze = {
+            let state_guard = self.state.read();
+            // let state = Arc::clone(&*&state_guard);
+
+            state_guard.memtable.put(_key, _value)?;
+
+            // 要更改 optional 中的尺寸值吗? optional 中是用来对比的.
+            let size = state_guard.memtable.approximate_size();
+
+            size > self.options.target_sst_size
+        }; // 读锁释放
+
+        if is_freeze {
+            // 对 "Lsm" 结构改变, 需要获取 ~State 写锁
+            let state_lock_guard = self.state_lock.lock();
+            self.force_freeze_memtable(&state_lock_guard)?;
+        }
+
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+        // unimplemented!()
+        // 你的 delete 实现应仅为该键放入一个空切片，我们称之为删除墓碑标记。你的 get 实现应相应处理这种情况。
+        let is_freeze = {
+            let state_guard = self.state.read();
+            // Arc::clone(&*&state_guard);
+
+            state_guard.memtable.put(_key, b"")?;
+
+            let size = state_guard.memtable.approximate_size();
+            size > self.options.target_sst_size
+        };
+
+        if is_freeze {
+            // 对 "Lsm" 结构改变, 需要获取 ~State 写锁
+            let state_lock_guard = self.state_lock.lock();
+            self.force_freeze_memtable(&state_lock_guard)?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -337,8 +421,22 @@ impl LsmStorageInner {
     }
 
     /// Force freeze the current memtable to an immutable memtable
+    // 一旦 memtale 达到限制, 应调用此函数来冻结当前 memtable 并创建新的 memtable.
+    // 在修改 LSM 状态时存在多个操作点：冻结可变内存表、将内存表刷入 SST 文件、以及垃圾回收/压缩。所有这些修改过程中都可能涉及 I/O 操作。
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        // unimplemented!()
+        // 调用此函数前应该获取锁: state_lock
+        let mut guard = self.state.write(); // 注意写锁是否重复获取
+        let state = Arc::make_mut(&mut *guard); // state 持有对 guard 内部数据的 &mut 借用.
+
+        // 还要检查一下.
+        let size = state.memtable.approximate_size();
+
+        // fix: 测试会调用, 故这里不能加判断 size > app_size. 那还要加吗? 加到哪里?
+        state.imm_memtables.insert(0, Arc::clone(&state.memtable)); // 克隆一份 Arc 放进去.  fix: 放到最前面
+        state.memtable = Arc::new(MemTable::create(self.next_sst_id()));
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
