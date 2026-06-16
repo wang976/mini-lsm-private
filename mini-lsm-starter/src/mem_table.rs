@@ -141,8 +141,25 @@ impl MemTable {
     }
 
     /// Get an iterator over a range of keys.
+    // week 1 day 2: 实现 LSM 的 scan 接口.  参数: 指定迭代器的范围
     pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
-        unimplemented!()
+        // unimplemented!()
+        let low = map_bound(_lower);
+        let up = map_bound(_upper);
+
+        let map = self.map.clone();
+        let mut it = {
+            MemTableIteratorBuilder {
+                map,
+                iter_builder: |map_ref| map_ref.range((low, up)),
+                item: (Bytes::default(), Bytes::default()),
+            }
+            .build() // woc, 这是什么语法.
+        };
+
+        let ret = it.next();
+
+        it
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
@@ -173,34 +190,74 @@ type SkipMapRangeIter<'a> =
 /// chapter for more information.
 ///
 /// This is part of week 1, day 2.
-#[self_referencing]
+///
+// 我们已利用 ouroboros 为您定义了自引用的 MemtableIterator 字段。
+// 您需要基于此提供的结构实现 MemtableIterator 逻辑和 Memtable::scan API。
+#[self_referencing] // ouroboros 库的宏, 其会自动生成构造函数. 用unsafe代码安全保障这个模式, 生成Builder构造器.
 pub struct MemTableIterator {
     /// Stores a reference to the skipmap.
     map: Arc<SkipMap<Bytes, Bytes>>,
     /// Stores a skipmap iterator that refers to the lifetime of `MemTableIterator` itself.
     #[borrows(map)]
     #[not_covariant]
-    iter: SkipMapRangeIter<'this>,
+    iter: SkipMapRangeIter<'this>, //
     /// Stores the current key-value pair.
     item: (Bytes, Bytes),
 }
 
+// 类比 C++
+// struct MemTableIterator {
+//     shared_ptr<SkipMap> map;
+//     SkipMapRangeIterator iter; // iter 指向 map 内部
+//     pair<Bytes, Bytes> item;
+// };
+
+// 为 MemTableIterator 类型实现 StorageIterator 这个接口.
+// 即给 MemTableIterator 实现统一的存储迭代器接口.
 impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        // unimplemented!()
+        &self.borrow_item().1
     }
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        // unimplemented!()
+        // let slice = &self.borrow_item().0;
+        // let key = Key::from_bytes(slice.clone());
+        // key.as_key_slice()
+        KeySlice::from_slice(self.borrow_item().0.as_ref())
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        // unimplemented!()
+        if self.borrow_item().clone() == (Bytes::default(), Bytes::default()) {
+            return false;
+        }
+
+        true
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // unimplemented!()
+        // ouroboros 会生成访问器。你需要用它提供的方式访问字段.
+        self.with_mut(|fields| {
+            let entry_opt = fields.iter.next();
+
+            match entry_opt {
+                Some(entry) => {
+                    fields.item.0 = entry.key().clone();
+                    fields.item.1 = entry.value().clone();
+                }
+                None => {
+                    // 无效, 设为默认值
+                    fields.item.0 = Bytes::default();
+                    fields.item.1 = Bytes::default();
+                }
+            };
+        });
+
+        Ok(())
     }
 }

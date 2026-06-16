@@ -31,6 +31,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
@@ -455,6 +456,31 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        // unimplemented!()
+        // 借助实现的所有迭代器, 完成 LSM 引擎的 scan 接口.
+        // 只需将内存表迭代器（记得将最新内存表放在合并迭代器最前面）组合成 LSM 迭代器，你的存储引擎就能处理扫描请求了.
+
+        // 思路: 先调用 memtable 的 scan 获得 memtable iterator 再 得到 vec<Box<>>, 调用merge iterator 的 create
+
+        let mut iters = Vec::new();
+        {
+            let state_guard = self.state.read();
+            let mem_iter = state_guard.memtable.scan(_lower, _upper);
+
+            iters.push(Box::new(mem_iter));
+
+            // 再添加 imm_memtable
+            for imm_mem in state_guard.imm_memtables.clone() {
+                let imm_iter = imm_mem.scan(_lower, _upper);
+                iters.push(Box::new(imm_iter));
+            }
+        };
+
+        // 调用 mergeiterator的create()
+        let mergeit = MergeIterator::create(iters);
+        let lsm = LsmIterator::new(mergeit)?;
+        let fuse = FusedIterator::new(lsm);
+
+        Ok(fuse)
     }
 }

@@ -20,9 +20,16 @@ pub const TS_ENABLED: bool = false;
 
 pub struct Key<T: AsRef<[u8]>>(T);
 
-pub type KeySlice<'a> = Key<&'a [u8]>;
-pub type KeyVec = Key<Vec<u8>>;
-pub type KeyBytes = Key<Bytes>;
+pub type KeySlice<'a> = Key<&'a [u8]>; // 借用视图, 不拥有数据.  迭代器返回key
+pub type KeyVec = Key<Vec<u8>>; // 自有                   需要构建/修改key
+pub type KeyBytes = Key<Bytes>; // 引用计数的             存储在 SkipMap 等结构中
+
+// C++ 里大概是这种关系
+// template<typename T>
+// class Key { T inner; ... };     // Key<T> 包装 T
+// using KeySlice = Key<span<const uint8_t>>;  // 借用视图
+// using KeyVec   = Key<vector<uint8_t>>;      // 自有的
+// using KeyBytes = Key<shared_ptr<Bytes>>;    // 引用计数的
 
 impl<T: AsRef<[u8]>> Key<T> {
     pub fn into_inner(self) -> T {
@@ -68,6 +75,7 @@ impl Key<Vec<u8>> {
         self.0.extend(key_slice.0);
     }
 
+    // 从 KeyVec 转换.
     pub fn as_key_slice(&self) -> KeySlice<'_> {
         Key(self.0.as_slice())
     }
@@ -91,6 +99,7 @@ impl Key<Vec<u8>> {
 }
 
 impl Key<Bytes> {
+    // 从 KeyBytes 转换.
     pub fn as_key_slice(&self) -> KeySlice<'_> {
         Key(&self.0)
     }
@@ -120,6 +129,7 @@ impl<'a> Key<&'a [u8]> {
     }
 
     /// Create a key slice from a slice. Will be removed in week 3.
+    // 从 &[u8] 切片直接构造
     pub fn from_slice(slice: &'a [u8]) -> Self {
         Self(slice)
     }
