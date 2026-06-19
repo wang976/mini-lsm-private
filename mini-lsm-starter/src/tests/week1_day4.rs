@@ -158,3 +158,39 @@ fn test_sst_seek_key() {
             .unwrap();
     }
 }
+
+#[test]
+fn test_sst_find_block_idx_returns_remaining_candidate() {
+    let mut builder = SsTableBuilder::new(4096);
+    for idx in 0..3 {
+        let key = key_of(idx);
+        let value = value_of(idx);
+        builder.add(key.as_key_slice(), &value[..]);
+    }
+    let dir = tempdir().unwrap();
+    let sst = builder.build_for_test(dir.path().join("1.sst")).unwrap();
+
+    assert_eq!(sst.num_of_blocks(), 1);
+    assert_eq!(sst.find_block_idx(key_of(1).as_key_slice()), 0);
+
+    let (_dir, sst) = generate_sst();
+    let last_key_idx = num_of_keys() - 1;
+    assert_ne!(sst.num_of_blocks(), 1);
+    assert_eq!(
+        sst.find_block_idx(key_of(last_key_idx).as_key_slice()),
+        sst.num_of_blocks() - 1
+    );
+}
+
+#[test]
+fn test_sst_iterator_seek_key_past_last_in_constructor() {
+    let (_dir, sst) = generate_sst();
+    let sst = Arc::new(sst);
+    let iter = SsTableIterator::create_and_seek_to_key(
+        sst,
+        KeySlice::for_testing_from_slice_no_ts(b"key_999"),
+    )
+    .unwrap();
+
+    assert!(!iter.is_valid());
+}

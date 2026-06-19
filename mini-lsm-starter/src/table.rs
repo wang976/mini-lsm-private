@@ -320,6 +320,14 @@ impl SsTable {
                 return mid; // key 在 mid block 中, 返回 mid index.
             }
         }
+
+        // 最终 left == right. 判断 key 是否在 left block 中.
+        let left_first_key = &self.block_meta[left].first_key;
+        let left_last_key = &self.block_meta[left].last_key;
+        if key >= left_first_key.as_key_slice() && key <= left_last_key.as_key_slice() {
+            return left;
+        }
+
         usize::MAX // key 不在该 SST 中, 返回一个不合法的 block index.
     }
 

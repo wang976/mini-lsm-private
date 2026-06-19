@@ -82,6 +82,17 @@ impl SsTableIterator {
         // unimplemented!()
         // 找到符合条件的第一个块.  这也有对应 api.
         let idx = Self::seek_to_key_inner(&table, key);
+
+        // 处理 idx 是否超出范围的情况.
+        if idx >= table.block_meta.len() {
+            let block = table.read_block(0)?; // 不必要的读磁盘.
+            return Ok(Self {
+                table,
+                blk_iter: BlockIterator::create_and_seek_to_first(block),
+                blk_idx: usize::MAX, // 迭代器无效.
+            });
+        }
+
         let block = table.read_block(idx)?;
 
         Ok(Self {
@@ -105,7 +116,7 @@ impl SsTableIterator {
         // }
 
         // 查看 idx 是否超出范围
-        if idx == self.table.block_meta.len() {
+        if idx >= self.table.block_meta.len() {
             self.blk_idx = usize::MAX;
             return Ok(());
         }
