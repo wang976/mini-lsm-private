@@ -180,6 +180,11 @@ impl MiniLsm {
     pub fn close(&self) -> Result<()> {
         // unimplemented!()
         // 用户调用 close 函数时，应等待刷新线程（以及第二周的压缩线程）完成.
+
+        // 在 close() 里 join 后台线程之前，先设置关闭状态，并主动通知相关后台线程，让它们从等待中醒来并检查退出条件。
+        self.compaction_notifier.send(()).ok();
+        self.flush_notifier.send(()).ok();
+
         let _ = self
             .flush_thread
             .lock()
@@ -549,20 +554,30 @@ impl LsmStorageInner {
     fn no_range_overlap(&self, sst: &SsTable, lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
         // 没有交集的情况: 1. sst 的最大 key 小于扫描范围的最小 key. 2. sst 的最小 key 大于扫描范围的最大 key.
         // 处理边界情况: 分别处理 included 和 excluded 的情况.
-        if let Bound::Included(lower_key) = lower {
-            return sst.last_key().raw_ref() < *lower_key;
+
+        // fix: 直接 return < ; 等会提前返回.  理解错了 carge 的本意, 本来也是将两个判断合在一起.
+        if let Bound::Included(lower_key) = lower
+            && sst.last_key().raw_ref() < *lower_key
+        {
+            return true;
         }
 
-        if let Bound::Excluded(lower_key) = lower {
-            return sst.last_key().raw_ref() <= *lower_key;
+        if let Bound::Excluded(lower_key) = lower
+            && sst.last_key().raw_ref() <= *lower_key
+        {
+            return true;
         }
 
-        if let Bound::Included(upper_key) = upper {
-            return sst.first_key().raw_ref() > *upper_key;
+        if let Bound::Included(upper_key) = upper
+            && sst.first_key().raw_ref() > *upper_key
+        {
+            return true;
         }
 
-        if let Bound::Excluded(upper_key) = upper {
-            return sst.first_key().raw_ref() >= *upper_key;
+        if let Bound::Excluded(upper_key) = upper
+            && sst.first_key().raw_ref() >= *upper_key
+        {
+            return true;
         }
 
         false
