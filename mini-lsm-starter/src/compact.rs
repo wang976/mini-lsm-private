@@ -160,7 +160,20 @@ impl LsmStorageInner {
         Ok(None)
     }
 
+    // 每 50 毫秒执行一次。如果 memtable 数量超过限制，应调用 force_flush_next_imm_memtable 来刷新一个 memtable
     fn trigger_flush(&self) -> Result<()> {
+        // loop {  // fix: 外围已经存在 loop 和 暂停
+        let state = {
+            let state_guard = self.state.read();
+            Arc::clone(&*state_guard)
+        };
+        if state.imm_memtables.len() + 1 >= self.options.num_memtable_limit {
+            self.force_flush_next_imm_memtable()?;
+        }
+
+        // 暂停 50 毫秒
+        // std::thread::sleep(Duration::from_millis(50));
+        // }
         Ok(())
     }
 

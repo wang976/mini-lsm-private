@@ -143,4 +143,16 @@ impl<
 
         Ok(())
     }
+
+    fn num_active_iterators(&self) -> usize {
+        let mut num = 0;
+        if self.a.is_valid() {
+            num += self.a.num_active_iterators();
+        }
+        if self.b.is_valid() {
+            num += self.b.num_active_iterators();
+        }
+
+        num
+    }
 }

@@ -40,6 +40,7 @@ use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
+use crate::table::SsTableBuilder;
 use crate::table::SsTableIterator;
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -177,7 +178,22 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        // unimplemented!()
+        // 用户调用 close 函数时，应等待刷新线程（以及第二周的压缩线程）完成.
+        let _ = self
+            .flush_thread
+            .lock()
+            .take()
+            .map(|h| h.join())
+            .transpose();
+        let _ = self
+            .compaction_thread
+            .lock()
+            .take()
+            .map(|h| h.join())
+            .transpose();
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -187,7 +203,7 @@ impl MiniLsm {
         let (tx1, rx) = crossbeam_channel::unbounded();
         let compaction_thread = inner.spawn_compaction_thread(rx)?;
         let (tx2, rx) = crossbeam_channel::unbounded();
-        let flush_thread = inner.spawn_flush_thread(rx)?;
+        let flush_thread = inner.spawn_flush_thread(rx)?; // 启动刷新线程.
         Ok(Arc::new(Self {
             inner,
             flush_notifier: tx2,
@@ -262,6 +278,7 @@ impl LsmStorageInner {
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
+    // 如果 LSM 数据库目录不存在，则需要创建该目录.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         let state = LsmStorageState::create(&options);
@@ -278,6 +295,13 @@ impl LsmStorageInner {
             ),
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
+
+        // 处理 path. 如果 LSM 数据库目录不存在，则需要创建该目录.
+        if !path.exists() {
+            std::fs::create_dir_all(path)?;
+        } else if !path.is_dir() {
+            anyhow::bail!("Path {} is not a directory", path.display());
+        }
 
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
@@ -471,13 +495,77 @@ impl LsmStorageInner {
     }
 
     /// Force flush the earliest-created immutable memtable to disk
+    // 实现将数据从内存移动到磁盘的逻辑（即所谓的刷新操作）.
+    // 要将内存表刷新到磁盘: 1. 选择一个可刷新的内存表.  2. 创建一个与内存表对应的SST 文件.  3. 将内存表从 imm_memtables 列表中移除, 并将 SST 文件添加到 L0 中.
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        // unimplemented!()
+        // 首先创建 SSTableBuilder.  注意正确获得锁.  先获取读锁, 再获取写锁
+        let state_lock = self.state_lock.lock();
+        let state = {
+            let guard = self.state.read();
+            Arc::clone(&*guard)
+        };
+
+        let block_size = self.options.block_size;
+
+        let mut sstbuilder = SsTableBuilder::new(block_size);
+
+        // 获取最早的 imm_memtable, 即末尾元素.
+        let imm_mem = match state.imm_memtables.last() {
+            Some(imm) => imm,
+            None => return Ok(()), // 没有可刷新的内存表, 直接返回
+        };
+
+        // 调用 memtable::flush 将数据写入 SSTableBuilder.
+        imm_mem.flush(&mut sstbuilder)?;
+
+        // 将 SST 文件添加到 L0 中.  fix: 不用 self.next_sst_id() 来获取 id, 因为 memtable 的 id 已经是 sst_id 了. 直接用 imm_mem 的 id 就行了.
+        let sst_id = imm_mem.id();
+        // 创建path
+        let sst_path = self.path_of_sst(sst_id);
+        // 注意: build 是慢操作.
+        let sstable = sstbuilder.build(sst_id, Some(self.block_cache.clone()), sst_path)?;
+
+        // build成功, 执行 step3. 更新相关参数. 将内存表从 imm_memtables 列表中移除. 可在这时获取写锁, 因为 flush 比较耗时.
+        {
+            let mut state_write_guard = self.state.write();
+            let state_write = Arc::make_mut(&mut *state_write_guard);
+
+            state_write.imm_memtables.pop();
+
+            state_write.sstables.insert(sst_id, Arc::new(sstable));
+            state_write.l0_sstables.insert(0, sst_id); // 新的放在最前面
+        }
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
         // no-op
         Ok(())
+    }
+
+    // 为 scan 中跳过不可能包含该键/键范围的 SST. 添加辅助函数
+    fn no_range_overlap(&self, sst: &SsTable, lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
+        // 没有交集的情况: 1. sst 的最大 key 小于扫描范围的最小 key. 2. sst 的最小 key 大于扫描范围的最大 key.
+        // 处理边界情况: 分别处理 included 和 excluded 的情况.
+        if let Bound::Included(lower_key) = lower {
+            return sst.last_key().raw_ref() < *lower_key;
+        }
+
+        if let Bound::Excluded(lower_key) = lower {
+            return sst.last_key().raw_ref() <= *lower_key;
+        }
+
+        if let Bound::Included(upper_key) = upper {
+            return sst.first_key().raw_ref() > *upper_key;
+        }
+
+        if let Bound::Excluded(upper_key) = upper {
+            return sst.first_key().raw_ref() >= *upper_key;
+        }
+
+        false
     }
 
     /// Create an iterator over a range of keys.
@@ -514,9 +602,18 @@ impl LsmStorageInner {
         }
 
         // 之后再创建 sstable iterator.  遍历所有 L0 SST 文件并为每个文件创建迭代器.
+        // w1d6: 跳过不可能包含该键/键范围的 SST.
         let mut sst_iters = Vec::new();
         for sst_id in snapshot.l0_sstables.iter() {
             let sst = snapshot.sstables.get(sst_id).unwrap();
+
+            // 利用 sst.first/last_key 来判断是否需要创建迭代器.  如果 sst 的 key 范围与扫描范围没有交集, 则跳过该 sst.
+            // 没有交集的情况: 1. sst 的最大 key 小于扫描范围的最小 key. 2. sst 的最小 key 大于扫描范围的最大 key.
+
+            if self.no_range_overlap(sst, &_lower, &_upper) {
+                continue;
+            }
+
             // let sst_iter = SsTableIterator::create_and_seek_to_key(sst.clone(), _lower.clone())?;
             let sst_iter = match _lower {
                 Bound::Included(lower_key) => SsTableIterator::create_and_seek_to_key(

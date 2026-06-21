@@ -163,8 +163,27 @@ impl MemTable {
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
+    // 要将内存表刷新到磁盘: 1. 选择一个可刷新的内存表.  2. 创建一个与内存表对应的SST 文件.  3. 将内存表从 imm_memtables 列表中移除, 并将 SST 文件添加到 L0 中.
     pub fn flush(&self, _builder: &mut SsTableBuilder) -> Result<()> {
-        unimplemented!()
+        // unimplemented!()
+        // 当前操作专注于 将 memtable 写入到 SsTableBuilder 中. 其余交给 LSMStorageInner::force_flush_next_imm_memtable.
+        // 使用 add 接口即可. 遍历 map 调用 add.  要使用 estimated_size 判断溢出吗?
+
+        // for (key, value) in &self.map {
+        //     _builder.add(key.as_ref(), value.as_ref());
+        // }
+
+        // 需要获取迭代器
+        let mut iter = self.scan(Bound::Unbounded, Bound::Unbounded);
+        while iter.is_valid() {
+            let key = iter.key();
+            let value = iter.value();
+            _builder.add(KeySlice::from_slice(key.raw_ref()), value.as_ref());
+
+            iter.next()?;
+        }
+
+        Ok(())
     }
 
     // &self 是不可变借用当前对象，类似 C++ 的 const MemTable& self，但 Rust 显式写出来
