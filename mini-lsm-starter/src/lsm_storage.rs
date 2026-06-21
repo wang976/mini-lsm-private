@@ -31,12 +31,16 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::Key;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
+use crate::table::SsTableIterator;
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -279,7 +283,7 @@ impl LsmStorageInner {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
             path: path.to_path_buf(),
-            block_cache: Arc::new(BlockCache::new(1024)),
+            block_cache: Arc::new(BlockCache::new(1024)), // 设置缓存容量. 1024 个 block 的缓存容量, 也就是 4MB 的缓存容量.
             next_sst_id: AtomicUsize::new(1),
             compaction_controller,
             manifest: None,
@@ -303,21 +307,19 @@ impl LsmStorageInner {
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
         // unimplemented!()
-        // let state =  {
-        //     let state_guard = self.state.read();
-        //     Arc::clone(&*&state_guard)
-        // };
-
-        let val = {
+        let state = {
             let state_guard = self.state.read();
-            state_guard.memtable.get(_key)
+            Arc::clone(&*state_guard)
         };
+
+        // tips: 在探查完所有内存表后，可以创建一个覆盖所有 SST 文件的合并迭代器.
+        let val = state.memtable.get(_key);
 
         // 若没找到key, 则依次查询下一层  memtable -> imm_memtable -> L0 SSTables -> L1/L2/...SSTables.
         if val.is_none() {
-            let state_guard = self.state.read();
+            // let state_guard = self.state.read();
 
-            for imm_table in &state_guard.imm_memtables {
+            for imm_table in &state.imm_memtables {
                 let imm_val = imm_table.get(_key);
 
                 match imm_val {
@@ -333,6 +335,34 @@ impl LsmStorageInner {
                     }
                 }
             }
+
+            // 处理 sstable. 目前可仅处理 L0 SSTable.  创建合并迭代器
+            let mut sst_iters = Vec::new();
+            for sst_id in state.l0_sstables.iter() {
+                let sst = state.sstables.get(sst_id).unwrap();
+                // let sst_iter = SsTableIterator::create_and_seek_to_first(sst.clone())?;
+                // fix: 从设计意图上, 应该使用 create_and_seek_to_key 来创建
+                let sst_iter =
+                    SsTableIterator::create_and_seek_to_key(sst.clone(), Key::from_slice(_key))?;
+                sst_iters.push(Box::new(sst_iter));
+            }
+
+            let merge_iter = MergeIterator::create(sst_iters);
+
+            // let mut it = merge_iter;
+
+            // 仅需判断第一个是否等于 key 即可.  因为找到的是 >= key 的第一个元素.
+            if merge_iter.is_valid() {
+                let key = merge_iter.key();
+                if key.to_key_vec().raw_ref() == _key {
+                    let value = merge_iter.value();
+                    if value.is_empty() {
+                        return Ok(None);
+                    } else {
+                        return Ok(Some(value.to_vec().into()));
+                    }
+                }
+            }
         }
 
         // 这里也要处理墓碑
@@ -342,7 +372,7 @@ impl LsmStorageInner {
             return Ok(None);
         }
 
-        // TODO(wangb): 当前未实现 L0以及 L1+ 的 SSTable 逻辑
+        // TODO(w1d5): 当前 L0 实现了, 未实现 L1+ 的 SSTable 逻辑
 
         Ok(val)
     }
@@ -460,25 +490,61 @@ impl LsmStorageInner {
         // 借助实现的所有迭代器, 完成 LSM 引擎的 scan 接口.
         // 只需将内存表迭代器（记得将最新内存表放在合并迭代器最前面）组合成 LSM 迭代器，你的存储引擎就能处理扫描请求了.
 
-        // 思路: 先调用 memtable 的 scan 获得 memtable iterator 再 得到 vec<Box<>>, 调用merge iterator 的 create
+        // [w1d5] 创建一个覆盖所有内存表和 SST 文件的合并迭代器，从而完成存储引擎的读取路径.
 
-        let mut iters = Vec::new();
-        {
+        // 思路: 先调用 memtable 的 scan 获得 memtable iterator 再 得到 vec<Box<>>, 调用merge iterator 的 create. -> 内存表迭代器
+        // SST 文件迭代器呢?  其没有对应 scan 操作. 如何调用 api.
+
+        // 你应首先读取 state 并克隆 LSM 状态快照的 Arc 。然后释放锁.
+        let snapshot = {
             let state_guard = self.state.read();
-            let mem_iter = state_guard.memtable.scan(_lower, _upper);
-
-            iters.push(Box::new(mem_iter));
-
-            // 再添加 imm_memtable
-            for imm_mem in state_guard.imm_memtables.clone() {
-                let imm_iter = imm_mem.scan(_lower, _upper);
-                iters.push(Box::new(imm_iter));
-            }
+            Arc::clone(&*state_guard)
         };
+        // 创建 memtable iterator.
+        let mut mti_iters = Vec::new();
+
+        // 先添加 memtable.
+        let mem_iter = snapshot.memtable.scan(_lower, _upper);
+        mti_iters.push(Box::new(mem_iter));
+
+        // 再添加已冻结, 等待 flush 的内存表.
+        for imm_mem in snapshot.imm_memtables.clone().iter() {
+            let imm_iter = imm_mem.scan(_lower, _upper);
+            mti_iters.push(Box::new(imm_iter));
+        }
+
+        // 之后再创建 sstable iterator.  遍历所有 L0 SST 文件并为每个文件创建迭代器.
+        let mut sst_iters = Vec::new();
+        for sst_id in snapshot.l0_sstables.iter() {
+            let sst = snapshot.sstables.get(sst_id).unwrap();
+            // let sst_iter = SsTableIterator::create_and_seek_to_key(sst.clone(), _lower.clone())?;
+            let sst_iter = match _lower {
+                Bound::Included(lower_key) => SsTableIterator::create_and_seek_to_key(
+                    sst.clone(),
+                    Key::from_slice(lower_key),
+                )?,
+                Bound::Excluded(lower_key) => {
+                    // 先 seek 到该 key，如果命中了相等的 key，再 skip 一次
+                    let mut iter = SsTableIterator::create_and_seek_to_key(
+                        sst.clone(),
+                        Key::from_slice(lower_key),
+                    )?;
+                    if iter.is_valid() && iter.key().raw_ref() == lower_key {
+                        iter.next()?;
+                    }
+                    iter
+                }
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst.clone())?,
+            };
+            sst_iters.push(Box::new(sst_iter));
+        }
 
         // 调用 mergeiterator的create()
-        let mergeit = MergeIterator::create(iters);
-        let lsm = LsmIterator::new(mergeit)?;
+        let a = MergeIterator::create(mti_iters);
+        let b = MergeIterator::create(sst_iters);
+        let innr_iter = TwoMergeIterator::create(a, b)?;
+        let upper_bound = map_bound(_upper);
+        let lsm = LsmIterator::new(innr_iter, upper_bound)?;
         let fuse = FusedIterator::new(lsm);
 
         Ok(fuse)

@@ -34,7 +34,7 @@ impl SsTableIterator {
     pub fn create_and_seek_to_first(table: Arc<SsTable>) -> Result<Self> {
         // unimplemented!()
         // 找第 0 个块.  调用现存的api即可.
-        let block = table.read_block(0)?;
+        let block = table.read_block_cached(0)?;
 
         Ok(Self {
             table,
@@ -47,7 +47,7 @@ impl SsTableIterator {
     pub fn seek_to_first(&mut self) -> Result<()> {
         // unimplemented!()
         self.blk_idx = 0;
-        let block = self.table.read_block(self.blk_idx)?;
+        let block = self.table.read_block_cached(self.blk_idx)?; // TODO: 修改为cache版本
         self.blk_iter = BlockIterator::create_and_seek_to_first(block);
 
         Ok(())
@@ -85,7 +85,7 @@ impl SsTableIterator {
 
         // 处理 idx 是否超出范围的情况.
         if idx >= table.block_meta.len() {
-            let block = table.read_block(0)?; // 不必要的读磁盘.
+            let block = table.read_block_cached(0)?; // 不必要的读磁盘.
             return Ok(Self {
                 table,
                 blk_iter: BlockIterator::create_and_seek_to_first(block),
@@ -93,7 +93,7 @@ impl SsTableIterator {
             });
         }
 
-        let block = table.read_block(idx)?;
+        let block = table.read_block_cached(idx)?;
 
         Ok(Self {
             table,
@@ -123,7 +123,7 @@ impl SsTableIterator {
 
         // 否则需要移动到新的块.
         self.blk_idx = idx;
-        let block = self.table.read_block(self.blk_idx)?;
+        let block = self.table.read_block_cached(self.blk_idx)?;
         self.blk_iter = BlockIterator::create_and_seek_to_key(block, key);
 
         Ok(())
@@ -171,7 +171,7 @@ impl StorageIterator for SsTableIterator {
 
         // 查看是否已经超出块的范围了.
         if self.blk_idx < self.table.block_meta.len() {
-            let block = self.table.read_block(self.blk_idx)?;
+            let block = self.table.read_block_cached(self.blk_idx)?;
             self.blk_iter = BlockIterator::create_and_seek_to_first(block);
         }
 

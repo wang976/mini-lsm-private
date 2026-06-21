@@ -15,39 +15,61 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use bytes::Bytes;
+use std::ops::Bound;
+
 use anyhow::Result;
 
 use crate::{
-    iterators::{StorageIterator, merge_iterator::MergeIterator},
+    iterators::{
+        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+    },
     mem_table::MemTableIterator,
+    table::SsTableIterator,
 };
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>; // TODO(w1d2): 目前只有多个内存表. 故按此定义.
+// type LsmIteratorInner = MergeIterator<MemTableIterator>;
+// [w1d5] 实现 TwoMergeIterator 后，我们可以将 LsmIteratorInner 的类型修改为以下形式:
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
+    end_bound: Bound<Bytes>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(mut iter: LsmIteratorInner) -> Result<Self> {
+    pub(crate) fn new(mut iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
         while iter.is_valid() {
             if !iter.value().is_empty() {
                 break;
             }
             iter.next()?;
         }
-        Ok(Self { inner: iter })
+        Ok(Self {
+            inner: iter,
+            end_bound,
+        })
     }
 }
 
 // LsmIterator不能简单透传 MergrIterator, 需要跳过 tombstone.
+// TODO()[w1d5] 你需要修改 LsmIterator 的迭代逻辑，确保当内部迭代器返回的键达到或超过指定的 end_bound 时停止迭代。
 impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
         // unimplemented!()
-        self.inner.is_valid()
+        match &self.end_bound {
+            Bound::Included(upper_key) => {
+                self.inner.is_valid() && self.inner.key().raw_ref() <= upper_key
+            }
+            Bound::Excluded(upper_key) => {
+                self.inner.is_valid() && self.inner.key().raw_ref() < upper_key
+            }
+            Bound::Unbounded => self.inner.is_valid(),
+        }
     }
 
     fn key(&self) -> &[u8] {
@@ -64,9 +86,10 @@ impl StorageIterator for LsmIterator {
     fn next(&mut self) -> Result<()> {
         // unimplemented!()
         // 调用 merge iterator 就行. ❌️
+        // 对于 MergeIterator 对应接口的调用 -> 对 TwoMergeIterator 的调用.
         self.inner.next()?;
         // 需要保证当前 value 不为空, 即不是 tombstone.  mergeiterator的next只看key序.
-        while self.inner.is_valid() {
+        while self.is_valid() {
             if !self.inner.value().is_empty() {
                 break;
             }

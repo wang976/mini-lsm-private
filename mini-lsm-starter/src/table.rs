@@ -266,6 +266,7 @@ impl SsTable {
     }
 
     /// Read a block from disk, with block cache. (Day 4)
+    // 对 read_block 的使用可以全部使用 read_block_cached.
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
         // unimplemented!()
         // block_cached 变量表示为可能有也可能没有.
