@@ -24,6 +24,7 @@ use crate::{
     iterators::{
         StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
     },
+    key::KeySlice,
     mem_table::MemTableIterator,
     table::SsTableIterator,
 };
@@ -41,7 +42,14 @@ pub struct LsmIterator {
 
 impl LsmIterator {
     pub(crate) fn new(mut iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
-        while iter.is_valid() {
+        // codex review: 需要保证 key 是否还在 end_bound 之内.
+        while iter.is_valid()
+            && match &end_bound {
+                Bound::Included(upper_key) => iter.key() <= KeySlice::from_slice(upper_key),
+                Bound::Excluded(upper_key) => iter.key() < KeySlice::from_slice(upper_key),
+                Bound::Unbounded => true,
+            }
+        {
             if !iter.value().is_empty() {
                 break;
             }
