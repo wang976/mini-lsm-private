@@ -334,6 +334,7 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
+    // 你可以修改 get 的读取路径，基于布隆过滤器过滤 SST。
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
         // unimplemented!()
         let state = {
@@ -365,10 +366,24 @@ impl LsmStorageInner {
                 }
             }
 
+            // 利用布隆过滤器在创建 SsTableIterator 前过滤 SSTable.
+            let key_hash = farmhash::fingerprint32(_key);
+
             // 处理 sstable. 目前可仅处理 L0 SSTable.  创建合并迭代器
             let mut sst_iters = Vec::new();
             for sst_id in state.l0_sstables.iter() {
                 let sst = state.sstables.get(sst_id).unwrap();
+
+                //  在这里实现
+                // fix: 如果 bloom 存在, 并且可能包含 key, 才查 SST -> 如果 bloom 存在, 并且一定不包含 key, 则跳过该 SST.
+                if let Some(bloom) = sst.bloom.as_ref()
+                    && !bloom.may_contain(key_hash)
+                {
+                    // false. 一定不存在, 故跳过
+                    continue;
+                }
+
+                // 可能包括key, 创建迭代器
                 // let sst_iter = SsTableIterator::create_and_seek_to_first(sst.clone())?;
                 // fix: 从设计意图上, 应该使用 create_and_seek_to_key 来创建
                 let sst_iter =

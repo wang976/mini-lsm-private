@@ -18,6 +18,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use super::bloom::Bloom;
 use anyhow::Result;
 
 use super::{BlockMeta, FileObject, SsTable};
@@ -37,7 +38,9 @@ pub struct SsTableBuilder {
     data: Vec<u8>,     // 已经编码好的 data blocks. 即 SST: block0 | block1 | ... | blockN.
     pub(crate) meta: Vec<BlockMeta>, // 已经编码好的 block 的 meta 信息.
     block_size: usize, // 目标 block 大小.  非 SST, 是传给 BlockBuilder 的单个 block 目标大小.
+    key_hashes: Vec<u32>,
 }
+// 你还需要通过 farmhash::fingerprint32 计算键的哈希值来构建布隆过滤器.
 
 impl SsTableBuilder {
     /// Create a builder based on target block size.
@@ -50,6 +53,7 @@ impl SsTableBuilder {
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
+            key_hashes: Vec::new(),
         }
     }
 
@@ -65,6 +69,9 @@ impl SsTableBuilder {
             if self.first_key.is_empty() {
                 self.first_key = key.raw_ref().to_vec();
             }
+
+            // 记录 key 的哈希值.  非第一个 block 的第一个 key 的哈希值在后面实现.
+            self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
             // 更新 last_key.
             self.last_key = key.raw_ref().to_vec();
             return;
@@ -94,6 +101,7 @@ impl SsTableBuilder {
         // 更新 first_key 和 last_key.
         self.first_key = key.raw_ref().to_vec();
         self.last_key = key.raw_ref().to_vec();
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref())); // 新建的 block 的第一个 key 的哈希值.
     }
 
     /// Get the estimated size of the SSTable.
@@ -140,14 +148,28 @@ impl SsTableBuilder {
         self.data
             .extend_from_slice(&(meta_block_offset as u32).to_le_bytes());
 
+        // 将布隆过滤器编码追加到 self.data 中.
+        // 创建布隆过滤器.
+        let bloom_filter_offset = self.data.len();
+        let bits_per_key = Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01);
+        let bloom = Bloom::build_from_key_hashes(&self.key_hashes, bits_per_key);
+        bloom.encode(&mut self.data);
+
+        // 将 bloom_filter_offset 编码追加到 self.data 中. 4字节
+        self.data
+            .extend_from_slice(&(bloom_filter_offset as u32).to_le_bytes());
+
         // 先获取 fileobject 编码 self.data
         let obj = FileObject::create(path.as_ref(), self.data.clone())?;
 
         // 这里的 first_key 和 last_key 是整个 SST 的边界 key.
         // first_key 需要读取, last_ley 可以使用 self.last_key.
-        // 读取前两个字节, 获取第一个key的长度, 再根据长度读第一个key.
-        let first_key_len = u16::from_le_bytes(self.data[0..2].try_into().unwrap()) as usize;
-        let sst_first_key = self.data[2..2 + first_key_len].to_vec();
+        // 添加布隆过滤器后, 第一个 block 的第一个 first_key 也是完整存储的, 前2字节的 overlap 为0, 直接读取第2到4字即可.
+        // let first_key_len = u16::from_le_bytes(self.data[2..4].try_into().unwrap()) as usize;
+        // let sst_first_key = self.data[4..4 + first_key_len].to_vec();
+
+        // 直接从第一个 meta 中获取 first_key.
+        let sst_first_key = self.meta[0].first_key.clone();
 
         // 其他参数来自 形参 和 SsTableBuilder 的字段.
         Ok(SsTable {
@@ -156,9 +178,9 @@ impl SsTableBuilder {
             block_meta_offset: meta_block_offset,
             id,
             block_cache,
-            first_key: KeyVec::from_vec(sst_first_key).into_key_bytes(),
+            first_key: sst_first_key,
             last_key: KeyVec::from_vec(self.last_key.clone()).into_key_bytes(),
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }

@@ -50,10 +50,30 @@ impl BlockBuilder {
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
         // unimplemented!()
+
+        // 记录 first_key.
+        if self.is_empty() {
+            self.first_key = key.to_key_vec();
+        }
+
+        // 键前缀编码: 计算与 first_key 的公共前缀长度, 只存储非公共前缀部分的长度和内容.
+        let overlap_len = if self.is_empty() {
+            0
+        } else {
+            self.first_key.common_prefix_len(key)
+        };
+        let rest_key = &key.raw_ref()[overlap_len..]; // 相当于 non_overlap_len, 即非公共前缀部分的 key 内容.
+        let rest_key_len = rest_key.len();
+
         // fix: 若当前是第一个kv, 即使其长度超过 block_size. 否则会陷入死循环.
         let cursize = self.data.len() + self.offsets.len() * 2; // 当前 block 的大小. 注意 offsets 中每个元素占 2 字节.
-        let newsize = cursize + key.len() + value.len() + 2 * 2 + 2 + 2; // 加入新的 kv 后的大小. 注意每个条目还需额外的 4 字节来存储 key 和 value 的长度.
-        // fix: 增加 offset和num_of_elements各2字节
+
+        // 计算添加布隆过滤器后
+        // overlap_len + rest_key_len
+        let key_info = 2 * 2 + rest_key_len;
+        let value_info = 2 + value.len();
+
+        let newsize = cursize + key_info + value_info + 2 + 2; // 增加 offset 和 num_of_elements 各2字节.  注: meta 和 bloom 是 sstable 中的.
 
         if newsize > self.block_size && !self.data.is_empty() {
             return false; // 加入新的 kv 会超过 block 大小限制, 返回 false.
@@ -64,14 +84,24 @@ impl BlockBuilder {
         // 先计算偏移量.  记录开始位置.
         self.offsets.push(self.data.len() as u16); // 记录当前条目的结束位置, 以便后续解码时使用.
 
-        // 再添加数据.
+        // 将 | overlap_len | rest_key_len | rest_key | value_len | value | 追加到 data 中.
         self.data
-            .extend_from_slice(&(key.len() as u16).to_le_bytes()); // 先写入key的长度
-        self.data.extend_from_slice(key.raw_ref()); // 再写入key的内容
+            .extend_from_slice(&(overlap_len as u16).to_le_bytes());
+        self.data
+            .extend_from_slice(&(rest_key_len as u16).to_le_bytes());
+        self.data.extend_from_slice(rest_key);
+        self.data
+            .extend_from_slice(&(value.len() as u16).to_le_bytes());
+        self.data.extend_from_slice(value);
 
-        self.data
-            .extend_from_slice(&(value.len() as u16).to_le_bytes()); // 先写入value的长度
-        self.data.extend_from_slice(value); // 再写入value的内容
+        // 再添加数据.
+        // self.data
+        //     .extend_from_slice(&(key.len() as u16).to_le_bytes()); // 先写入key的长度
+        // self.data.extend_from_slice(key.raw_ref()); // 再写入key的内容
+
+        // self.data
+        //     .extend_from_slice(&(value.len() as u16).to_le_bytes()); // 先写入value的长度
+        // self.data.extend_from_slice(value); // 再写入value的内容
 
         true // 成功加入新的 kv, 返回 true.
     }

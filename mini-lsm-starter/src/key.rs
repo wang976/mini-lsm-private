@@ -47,6 +47,17 @@ impl<T: AsRef<[u8]>> Key<T> {
     pub fn for_testing_ts(self) -> u64 {
         0
     }
+
+    pub fn common_prefix_len(&self, other: KeySlice) -> usize {
+        let a: &[u8] = self.0.as_ref();
+        let b: &[u8] = other.0;
+        let min_len = a.len().min(b.len());
+        let mut i = 0;
+        while i < min_len && a[i] == b[i] {
+            i += 1;
+        }
+        i
+    }
 }
 
 impl Key<Vec<u8>> {

@@ -83,16 +83,27 @@ impl Bloom {
     }
 
     /// Build bloom filter from key hashes
+    // 传入的 keys 已经预计算好的 32 位哈希值数组, 非原始键.
     pub fn build_from_key_hashes(keys: &[u32], bits_per_key: usize) -> Self {
         let k = (bits_per_key as f64 * 0.69) as u32;
-        let k = k.clamp(1, 30);
+        let k = k.clamp(1, 30); // 将值限制在 1 到 30 之间.
         let nbits = (keys.len() * bits_per_key).max(64);
         let nbytes = nbits.div_ceil(8);
-        let nbits = nbytes * 8;
+        let nbits = nbytes * 8; // 将 nbits 对齐到字节边界.
+
+        // 分配并初始化了对应大小的位数组.
         let mut filter = BytesMut::with_capacity(nbytes);
         filter.resize(nbytes, 0);
 
         // TODO: build the bloom filter
+        // 你将根据键哈希值（u32 数字）构建一个布隆过滤器. 对于每个哈希值，你需要设置 k 个位. 注意: keys 是 hash 值数组.
+        for h in keys {
+            let delta = h.rotate_left(15);
+            for i in 0..k {
+                let pos = (h.wrapping_add(i.wrapping_mul(delta))) % (nbits as u32); // 溢出处理
+                filter.set_bit(pos as usize, true);
+            }
+        }
 
         Self {
             filter: filter.freeze(),
@@ -107,9 +118,16 @@ impl Bloom {
             true
         } else {
             let nbits = self.filter.bit_len();
-            let delta = h.rotate_left(15);
+            let delta = h.rotate_left(15); // 对 h 做循环左移 15 位, 得到 delta (第二个哈希值)
 
             // TODO: probe the bloom filter
+            // 查对应的 k 个位置, 只要有一个位置为 0 就可以返回 false. 需要注意 nbits 的值.
+            for i in 0..self.k {
+                let pos = (h.wrapping_add((i as u32).wrapping_mul(delta))) % (nbits as u32);
+                if !self.filter.get_bit(pos as usize) {
+                    return false;
+                }
+            }
 
             true
         }

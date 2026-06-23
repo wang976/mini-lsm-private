@@ -187,13 +187,24 @@ impl SsTable {
         let file_size = file.size() as usize;
         let file_data = file.read(0, file.size())?;
 
-        // 读取最后 4字节获取 meta_block_offset, 以便后续读取 block 数据时使用.
-        let meta_block_offset =
-            u32::from_le_bytes(file_data[file_data.len() - 4..].try_into().unwrap()) as usize;
+        // 先读取最后 4 字节获取 bloom_filter_offset, 以便后续读取 bloom filter 数据时使用.
+        let bloom_filter_offset = u32::from_le_bytes(
+            file_data[file_data.len() - 4..file_data.len()]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let bloom_data = Bloom::decode(&file_data[bloom_filter_offset..file_data.len() - 4])?;
+
+        // 从 bloom_filter_offset 往前读取 4字节 获取 meta_block_offset, 以便后续读取 block 数据时使用.
+        let meta_block_offset = u32::from_le_bytes(
+            file_data[bloom_filter_offset - 4..bloom_filter_offset]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
         // 传入 meta section 数据, 解码出 block_meta 信息.
         let block_meta =
-            BlockMeta::decode_block_meta(&file_data[meta_block_offset..file_data.len() - 4]);
+            BlockMeta::decode_block_meta(&file_data[meta_block_offset..bloom_filter_offset - 4]);
 
         // 从 meta_block_offset 处读取第一个 block 的 first_key, 以便设置 SST 的 first_key.
         let first_block_meta = &block_meta[0];
@@ -214,7 +225,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom_data),
             max_ts: 0,
         })
     }

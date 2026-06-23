@@ -47,28 +47,132 @@ impl BlockIterator {
         }
     }
 
+    // 添加辅助函数, 通过 idx 获取 key-value.
+    fn get_key(block: &Block, idx: usize) -> KeyVec {
+        // 先根据 offset 读取在 data section 中的起始位置.
+        let entry_begin = block.offsets[idx] as usize;
+
+        // 读取 entry 中前两字节, 获取 key 的长度.  -> 获取 overlap_len
+        let overlap_len =
+            u16::from_le_bytes(block.data[entry_begin..entry_begin + 2].try_into().unwrap())
+                as usize;
+
+        // 读取该 block 中的 first_key, 以便恢复 key.
+        let first_key = if idx == 0 {
+            // 如果是第一个条目, 直接读取 first_key.
+            let first_key_len = u16::from_le_bytes(
+                block.data[entry_begin + 2..entry_begin + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            KeyVec::for_testing_from_vec_no_ts(
+                block.data[entry_begin + 4..entry_begin + 4 + first_key_len].to_vec(),
+            )
+        } else {
+            // 如果不是第一个条目, 需要从第0个条目中读取 first_key. 这里假设 first_key 在整个 block 中是相同的.
+            let prev_entry_begin = block.offsets[0] as usize;
+            let prev_overlap_len = u16::from_le_bytes(
+                block.data[prev_entry_begin..prev_entry_begin + 2]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let prev_first_key_len = u16::from_le_bytes(
+                block.data[prev_entry_begin + 2..prev_entry_begin + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            KeyVec::for_testing_from_vec_no_ts(
+                block.data[prev_entry_begin + 4..prev_entry_begin + 4 + prev_first_key_len]
+                    .to_vec(),
+            )
+        };
+
+        // 根据 overlap_len 读取 first_key 中的 公共前缀.
+        let pre_key = &first_key.raw_ref()[..overlap_len];
+
+        // 紧接读取接下来的 2B 获取 rest_key_len.
+        let rest_key_len = u16::from_le_bytes(
+            block.data[entry_begin + 2..entry_begin + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        // 获取 rest_key.
+        let rest_key = &block.data[entry_begin + 4..entry_begin + 4 + rest_key_len];
+
+        // 拼接 pre_key 和 rest_key 得到完整的 key.
+        let full_key = [pre_key, rest_key].concat();
+
+        KeySlice::from_slice(full_key.as_slice()).to_key_vec()
+    }
+
     // 抽象出同一个函数 id -> key-value.  fix: Arc<Block> -> &Block
+    // 添加布隆过滤器后, 读取逻辑需要修改.
     fn get_key_value(block: &Block, idx: usize) -> (KeyVec, (usize, usize)) {
         // 先根据 offset 读取在 data section 中的起始位置.
         let entry_begin = block.offsets[idx] as usize;
 
-        // 读取 entry 中前两字节, 获取 key 的长度.
-        let key_len =
+        // 读取 entry 中前两字节, 获取 key 的长度.  -> 获取 overlap_len
+        let overlap_len =
             u16::from_le_bytes(block.data[entry_begin..entry_begin + 2].try_into().unwrap())
                 as usize;
-        let key = KeyVec::for_testing_from_vec_no_ts(
-            block.data[entry_begin + 2..entry_begin + 2 + key_len].to_vec(),
-        );
 
-        // 再继续读 key + key_len 后的两字节, 获取 value 的长度.
+        // 读取该 block 中的 first_key, 以便恢复 key.
+        let first_key = if idx == 0 {
+            // 如果是第一个条目, 直接读取 first_key.
+            let first_key_len = u16::from_le_bytes(
+                block.data[entry_begin + 2..entry_begin + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            KeyVec::for_testing_from_vec_no_ts(
+                block.data[entry_begin + 4..entry_begin + 4 + first_key_len].to_vec(),
+            )
+        } else {
+            // 如果不是第一个条目, 需要从第0个条目中读取 first_key. 这里假设 first_key 在整个 block 中是相同的.
+            let prev_entry_begin = block.offsets[0] as usize;
+            let prev_overlap_len = u16::from_le_bytes(
+                block.data[prev_entry_begin..prev_entry_begin + 2]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let prev_first_key_len = u16::from_le_bytes(
+                block.data[prev_entry_begin + 2..prev_entry_begin + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            KeyVec::for_testing_from_vec_no_ts(
+                block.data[prev_entry_begin + 4..prev_entry_begin + 4 + prev_first_key_len]
+                    .to_vec(),
+            )
+        };
+
+        // 根据 overlap_len 读取 first_key 中的 公共前缀.
+        let pre_key = &first_key.raw_ref()[..overlap_len];
+
+        // 紧接读取接下来的 2B 获取 rest_key_len.
+        let rest_key_len = u16::from_le_bytes(
+            block.data[entry_begin + 2..entry_begin + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        // 获取 rest_key.
+        let rest_key = &block.data[entry_begin + 4..entry_begin + 4 + rest_key_len];
+
+        // 拼接 pre_key 和 rest_key 得到完整的 key.
+        let full_key = [pre_key, rest_key].concat();
+        let key = KeySlice::from_slice(full_key.as_slice()).to_key_vec();
+
+        // 再继续读 overlap_len(2B) + rest_key_len(2B) + rest_key.len 后的 2B 获取 value_len.
         let value_len = u16::from_le_bytes(
-            block.data[entry_begin + 2 + key_len..entry_begin + 2 + key_len + 2]
+            block.data[entry_begin + 4 + rest_key_len..entry_begin + 4 + rest_key_len + 2]
                 .try_into()
                 .unwrap(),
         ) as usize;
         let value_range = (
-            entry_begin + 2 + key_len + 2,
-            entry_begin + 2 + key_len + 2 + value_len,
+            entry_begin + 4 + rest_key_len + 2,
+            entry_begin + 4 + rest_key_len + 2 + value_len,
         );
 
         (key, value_range)
@@ -109,13 +213,15 @@ impl BlockIterator {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let mid_offset = block.offsets[mid] as usize;
-            let mid_key_len =
-                u16::from_le_bytes(block.data[mid_offset..mid_offset + 2].try_into().unwrap())
-                    as usize;
-            let mid_key = KeySlice::for_testing_from_slice_no_ts(
-                &block.data[mid_offset + 2..mid_offset + 2 + mid_key_len],
-            );
+            // let mid_offset = block.offsets[mid] as usize;
+            // let mid_key_len =
+            //     u16::from_le_bytes(block.data[mid_offset..mid_offset + 2].try_into().unwrap())
+            //         as usize;
+            // let mid_key = KeySlice::for_testing_from_slice_no_ts(
+            //     &block.data[mid_offset + 2..mid_offset + 2 + mid_key_len],
+            // );
+            let mid_key_vec = Self::get_key(&block, mid);
+            let mid_key = mid_key_vec.as_key_slice();
             if mid_key < key {
                 left = mid + 1;
             } else {
@@ -222,15 +328,17 @@ impl BlockIterator {
         let mut right = offset_end;
         while left < right {
             let mid = left + (right - left) / 2;
-            let mid_offset = self.block.offsets[mid] as usize;
-            let mid_key_len = u16::from_le_bytes(
-                self.block.data[mid_offset..mid_offset + 2]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let mid_key = KeySlice::for_testing_from_slice_no_ts(
-                &self.block.data[mid_offset + 2..mid_offset + 2 + mid_key_len],
-            );
+            // let mid_offset = self.block.offsets[mid] as usize;
+            // let mid_key_len = u16::from_le_bytes(
+            //     self.block.data[mid_offset..mid_offset + 2]
+            //         .try_into()
+            //         .unwrap(),
+            // ) as usize;
+            // let mid_key = KeySlice::for_testing_from_slice_no_ts(
+            //     &self.block.data[mid_offset + 2..mid_offset + 2 + mid_key_len],
+            // );
+            let mid_key_vec = Self::get_key(&self.block, mid);
+            let mid_key = mid_key_vec.as_key_slice();
             if mid_key < key {
                 left = mid + 1;
             } else {
